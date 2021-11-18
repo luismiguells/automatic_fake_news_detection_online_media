@@ -1,1 +1,1 @@
-# automatic_fake_news_detection_online_media
+# Automatic Fake News Detection in Online Media
