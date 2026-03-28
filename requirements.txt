@@ -1,0 +1,10 @@
+pandas
+numpy
+scikit-learn
+nltk
+tensorflow
+ktrain
+fasttext
+gensim
+emoji
+openpyxl
