@@ -1,0 +1,283 @@
+# -*- coding: utf-8 -*-
+"""
+GloVe model for fake news classification.
+Transforms text data using pre-trained GloVe vectors and applies several classifiers
+(SVM, LR, SGDC, MNB, KNN, RF) with cross-validation.
+"""
+
+import time
+import sys
+import warnings
+import numpy as np
+from pathlib import Path
+from sklearn import metrics, svm
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression, SGDClassifier
+from sklearn.model_selection import StratifiedKFold, cross_val_score
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.naive_bayes import MultinomialNB
+from sklearn.preprocessing import normalize
+
+# Add the parent directory of this script to sys.path to import utils
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+from utils import read_labels, read_text_data
+
+# Suppress warnings
+warnings.filterwarnings('ignore')
+
+def glove_reader(glove_file):
+    """
+    Reads a GloVe file and returns a dictionary of word vectors.
+
+    Args:
+        glove_file (Path): Path to the GloVe file.
+
+    Returns:
+        dict: A dictionary where keys are words and values are vectors (list of floats).
+    """
+    glove_dict = {}
+    with open(glove_file, 'r', encoding='utf-8') as f:
+        for line in f:
+            tokens = line.strip().split()
+            if len(tokens) > 1:
+                word = tokens[0]
+                vector = [float(token) for token in tokens[1:]]
+                glove_dict[word] = vector
+    return glove_dict
+
+def remove_empty_text_data_glove(corpus, labels):
+    """
+    Removes elements from corpus and labels where the corpus entry is empty.
+
+    Args:
+        corpus (list): List of text strings.
+        labels (list): List of labels.
+
+    Returns:
+        tuple: (cleaned_corpus, cleaned_labels)
+    """
+    indices_to_remove = [i for i, line in enumerate(corpus) if len(line) == 0]
+    
+    for idx in sorted(indices_to_remove, reverse=True):
+        corpus.pop(idx)
+        labels.pop(idx)
+        
+    return corpus, labels
+
+def remove_nan_values(corpus, labels):
+    """
+    Removes elements from corpus and labels where the corpus entry contains NaN values.
+
+    Args:
+        corpus (list/np.array): List or array of vectors.
+        labels (np.array): Array of labels.
+
+    Returns:
+        tuple: (cleaned_corpus, cleaned_labels)
+    """
+    indices_to_remove = [i for i, vec in enumerate(corpus) if np.isnan(vec).any()]
+    
+    if indices_to_remove:
+        corpus = list(corpus)
+        labels = list(labels)
+        for idx in sorted(indices_to_remove, reverse=True):
+            corpus.pop(idx)
+            labels.pop(idx)
+        return corpus, np.asarray(labels)
+    
+    return corpus, labels
+
+def run_glove_classification(dataset, lang, main_dir, glove_file, results_base_dir):
+    """
+    Runs the GloVe classification pipeline.
+
+    Args:
+        dataset (str): Name of the dataset.
+        lang (str): Language of the dataset ('spanish' or 'english').
+        main_dir (Path): Directory containing dataset files.
+        glove_file (Path): Path to the pre-trained GloVe vectors.
+        results_base_dir (Path): Base directory to save results.
+    """
+    labels_file = main_dir / 'labels.txt'
+    words_file = main_dir / 'split/words.txt'
+    labels_names = ['True', 'Fake']
+
+    if not labels_file.exists():
+        print(f"Labels file not found: {labels_file}")
+        return
+
+    # Reading data
+    labels_list = read_labels(labels_file, labels_names)
+    corpus = read_text_data(lang, words_file)
+
+    # Remove empty elements
+    corpus, labels_list = remove_empty_text_data_glove(corpus, labels_list)
+    labels = np.asarray(labels_list)
+
+    # Load GloVe vectors
+    print(f"Loading GloVe vectors from {glove_file}...")
+    glove_dict = glove_reader(glove_file)
+    
+    # Vectorize corpus
+    vector_dim = 300 if lang == 'spanish' else 200
+    gv = []
+    
+    for line in corpus:
+        words = line.split()
+        s = np.zeros(vector_dim)
+        count = 0
+        for w in words:
+            if w in glove_dict:
+                s += glove_dict[w]
+                count += 1
+        
+        if count > 0:
+            s = s / count
+        gv.append(s)
+
+    # Remove NaN values (from empty intersections)
+    gv, labels = remove_nan_values(gv, labels)
+    gv_corpus = np.array(gv)
+
+    # Normalize the data
+    n_samples, n_features = gv_corpus.shape
+    min_values = np.min(gv_corpus, axis=1).reshape((n_samples, 1))
+    gv_corpus = gv_corpus + abs(min_values)
+    gv_corpus = normalize(gv_corpus, norm='l2')
+
+    classifiers = ['SVM', 'LR', 'MNB', 'SGDC', 'KNN', 'RF']
+
+    for cl_name in classifiers:
+        print(f'Training and testing with {cl_name}')
+        out_dir = results_base_dir / cl_name / 'GloVe' / dataset
+        out_dir.mkdir(parents=True, exist_ok=True)
+        
+        skf = StratifiedKFold(n_splits=10, random_state=0, shuffle=True)
+        scores = {
+            'accuracy': [], 'precision': [], 'recall': [], 
+            'f1': [], 'kappa': [], 'roc_auc': []
+        }
+        
+        start_time = time.time()
+        
+        for i, (train_index, test_index) in enumerate(skf.split(gv_corpus, labels)):
+            print(f'Fold: {i}')
+            data_train = gv_corpus[train_index]
+            data_test = gv_corpus[test_index]
+            labels_train, labels_test = labels[train_index], labels[test_index]
+            
+            # Model selection with hyperparameter tuning
+            if cl_name == 'SVM':
+                cs = [0.01, 0.1, 1, 10, 100]
+                best_c = 0
+                best_score = 0
+                for c in cs:
+                    clf_inner = svm.SVC(C=c, kernel='linear')
+                    inner_cv = StratifiedKFold(n_splits=3, random_state=0, shuffle=True)
+                    score = np.mean(cross_val_score(clf_inner, data_train, labels_train, scoring='f1_macro', cv=inner_cv))
+                    if score > best_score:
+                        best_score = score
+                        best_c = c
+                clf = svm.SVC(C=best_c, kernel='linear', probability=True)
+                    
+            elif cl_name == 'LR':
+                cs = [0.01, 0.1, 1, 10, 100]
+                best_c = 0
+                best_score = 0
+                for c in cs:
+                    clf_inner = LogisticRegression(C=c, penalty='l2', solver='liblinear')
+                    inner_cv = StratifiedKFold(n_splits=3, random_state=0, shuffle=True)
+                    score = np.mean(cross_val_score(clf_inner, data_train, labels_train, scoring='f1_macro', cv=inner_cv))
+                    if score > best_score:
+                        best_score = score
+                        best_c = c
+                clf = LogisticRegression(C=best_c, penalty='l2', solver='liblinear')
+            
+            elif cl_name == 'SGDC':
+                cs = [0.01, 0.1, 1, 10, 100]
+                best_c = 0
+                best_score = 0
+                for c in cs:
+                    clf_inner = SGDClassifier(loss='log', alpha=1/c, max_iter=10000)
+                    inner_cv = StratifiedKFold(n_splits=3, random_state=0, shuffle=True)
+                    score = np.mean(cross_val_score(clf_inner, data_train, labels_train, scoring='f1_macro', cv=inner_cv))
+                    if score > best_score:
+                        best_score = score
+                        best_c = c
+                clf = SGDClassifier(loss='log', alpha=1/best_c, max_iter=10000)
+            
+            elif cl_name == 'MNB':
+                clf = MultinomialNB()
+            
+            elif cl_name == 'KNN':
+                ks = [1, 2, 3, 5, 10]
+                best_k = 0
+                best_score = 0
+                for k in ks:
+                    clf_inner = KNeighborsClassifier(n_neighbors=k)
+                    inner_cv = StratifiedKFold(n_splits=3, random_state=0, shuffle=True)
+                    score = np.mean(cross_val_score(clf_inner, data_train, labels_train, scoring='f1_macro', cv=inner_cv))
+                    if score > best_score:
+                        best_score = score
+                        best_k = k
+                clf = KNeighborsClassifier(n_neighbors=best_k)
+                
+            elif cl_name == 'RF':
+                rs = [10, 50, 100, 200, 500]
+                best_r = 0
+                best_score = 0
+                for r in rs:
+                    clf_inner = RandomForestClassifier(n_estimators=r, random_state=0)
+                    inner_cv = StratifiedKFold(n_splits=3, random_state=0, shuffle=True)
+                    score = np.mean(cross_val_score(clf_inner, data_train, labels_train, scoring='f1_macro', cv=inner_cv))
+                    if score > best_score:
+                        best_score = score
+                        best_r = r
+                clf = RandomForestClassifier(n_estimators=best_r, random_state=0)
+            
+            clf.fit(data_train, labels_train)
+            predicted = clf.predict(data_test)
+            predicted_proba = clf.predict_proba(data_test)
+            
+            # Metrics
+            scores['accuracy'].append(np.mean(predicted == labels_test))
+            scores['precision'].append(metrics.precision_score(labels_test, predicted, average='macro'))
+            scores['recall'].append(metrics.recall_score(labels_test, predicted, average='macro'))
+            scores['f1'].append(metrics.f1_score(labels_test, predicted, average='macro'))
+            scores['kappa'].append(metrics.cohen_kappa_score(labels_test, predicted))
+            scores['roc_auc'].append(metrics.roc_auc_score(labels_test, predicted, average='macro'))
+            
+            # Save predictions
+            predictions = np.concatenate((
+                test_index[:, None], 
+                predicted_proba, 
+                predicted[:, None].astype(int), 
+                labels_test[:, None].astype(int)
+            ), axis=1)
+            header = 'test_index, probability_true, probability_fake, predicted_class, real_class'
+            np.savetxt(out_dir / f'fold_{i}.csv', predictions, fmt=['%d', '%1.9f', '%1.9f', '%d', '%d'],
+                       delimiter=',', encoding='utf-8', header=header, comments='')
+        
+        end_time = time.time()
+        
+        # Print results
+        for metric, values in scores.items():
+            print(f'{metric.capitalize()}: mean={np.mean(values):.2f} std={np.std(values):.2f} median={np.median(values):.2f}')
+        print(f'Total time: {end_time - start_time:.2f}s\n')
+
+if __name__ == "__main__":
+    # Configuration
+    DATASET = 'fncn_dataset'
+    LANG = 'spanish'
+    
+    project_root = Path(__file__).resolve().parent.parent.parent
+    BASE_DIR = project_root / 'data'
+    
+    if LANG == 'spanish':
+        GLOVE_PATH = BASE_DIR / 'pre_trained_models/glove_spanish_300.vec'
+    else:
+        GLOVE_PATH = BASE_DIR / 'pre_trained_models/glove_english_200.txt'
+        
+    RESULTS_DIR = project_root / 'results' / 'probabilities'
+    
+    run_glove_classification(DATASET, LANG, BASE_DIR / DATASET, GLOVE_PATH, RESULTS_DIR)
