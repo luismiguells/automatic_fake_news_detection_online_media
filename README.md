@@ -51,6 +51,25 @@ Tailored experiments for specific datasets and advanced techniques:
 - NLTK
 - Transformers (for BERT models)
 - FastText / Gensim (for word embeddings)
+- Ktrain
+- TensorFlow
+- Emoji
+- Openpyxl (for Excel files)
+
+## Installation
+
+To install all the necessary dependencies, run the following command:
+
+```bash
+pip install -r requirements.txt
+```
+
+Additionally, some models require NLTK data. You can download it using:
+
+```python
+import nltk
+nltk.download('stopwords')
+```
 
 ## Usage
 
